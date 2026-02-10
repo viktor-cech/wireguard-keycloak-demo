@@ -1,6 +1,7 @@
 core:
   admin_user: admin@wgportal.local
   admin_password: admin1234
+  admin_api_token: demo-api-token-change-me
   create_default_peer: false
   self_provisioning_allowed: true
   import_existing: true
@@ -35,3 +36,4 @@ advanced:
   start_cidr_v4: 10.10.0.0/24
   use_ip_v6: false
   config_storage_path: /etc/wireguard
+  expiry_check_interval: 15m

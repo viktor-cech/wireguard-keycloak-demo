@@ -1,47 +1,51 @@
-# WireGuard VPN + Keycloak Authentication
+# WireGuard VPN + Keycloak Authentication + Real-time Revocation
 
-PoC: WireGuard VPN authentication via Keycloak (OIDC) using WireGuard Portal as middleware.
+PoC: WireGuard VPN authentication via Keycloak (OIDC) using WireGuard Portal as middleware,
+with **real-time VPN revocation** when a user is disabled in Keycloak.
 
 ---
 
 ## How it works
 
+### The problem
+
 WireGuard is a VPN — it creates an encrypted tunnel between your device and a server.
 But WireGuard only understands cryptographic keys. It has no login page, no passwords,
-no MFA. If someone has the key file, they're in.
+no user management. If someone has the key file (`.conf`), they're in.
 
-**Without Keycloak (pure WireGuard):**
-```
-Admin manually creates a key pair
-Admin manually puts it in a .conf file
-Admin sends the .conf file to the employee via email/Slack/whatever
-Employee runs: wg-quick up client.conf
-Employee pings 10.10.0.1 ✓
+Without any management layer:
+- Admin manually creates keys, sends `.conf` files to employees
+- Employee connects with `wg-quick up client.conf`
+- If the employee leaves the company, admin must manually delete their key from the server
+- If admin forgets, the ex-employee still has VPN access forever
 
-WORKS FINE. No Keycloak needed.
-```
+### Our solution: three layers
 
-**With Keycloak (what we built):**
-```
-Employee opens WireGuard Portal in browser
-Portal says "log in via Keycloak first"
-Employee logs in with username + password + MFA
-Portal generates the key pair FOR the employee
-Employee downloads the .conf file from the portal
-Employee runs: wg-quick up client.conf
-Employee pings 10.10.0.1 ✓
+**Layer 1 — Keycloak (identity):** Controls who can log in and download a VPN config.
+Employees authenticate with username/password/MFA before they can get a `.conf` file.
 
-THE PING IS IDENTICAL. WireGuard doesn't know Keycloak exists.
-```
+**Layer 2 — WireGuard Portal (management):** A web UI that sits between Keycloak and
+WireGuard. It manages users, generates key pairs, and lets employees download their config.
+It also exposes a REST API for automation.
 
-**So what's the point of Keycloak?** It controls **who gets the .conf file**:
+**Layer 3 — WG Access Manager (revocation):** A small service that listens for Keycloak
+webhooks. When an admin disables a user in Keycloak, it automatically disables their
+VPN peers in WireGuard Portal, which removes them from the server.
 
-- Without Keycloak: keys are lying on a table, anyone can grab them
-- With Keycloak: keys are in a locked safe, you need to prove your identity to get them
-- The key itself works the same either way
+### Key concept: `wg0` vs client interfaces
 
-Keycloak adds: login with credentials, MFA, logging of who connected when,
-easy user management (disable user → no more VPN access).
+WireGuard creates **network interfaces** (like virtual network cards):
+
+- **`wg0`** is the **server** interface. It runs on the VPN server, listens on port 51820,
+  and has a list of allowed peers (clients). Think of it as the "door" — it decides who
+  gets in. `sudo wg show wg0` shows all connected peers.
+
+- **`test`** (or `client`) is the **client** interface. It's created on the employee's
+  machine when they run `wg-quick up test.conf`. It only knows about one peer: the server.
+
+When a peer is **removed from `wg0`**, the server no longer accepts that client's traffic.
+The client can still try to connect (the `.conf` file still exists), but the server
+ignores it — like having a key to a lock that's been changed.
 
 ---
 
@@ -52,30 +56,57 @@ easy user management (disable user → no more VPN access).
 │   User   │ ──────  Keycloak" ────────► │ Keycloak │
 │ (browser)│ ◄──── 2. Token (verified) ── │ (port    │
 │          │                              │  8080)   │
-└────┬─────┘                              └──────────┘
-     │
-     │ 3. Authenticated → can access WireGuard Portal
-     ▼
+└────┬─────┘                              └─────┬────┘
+     │                                          │
+     │ 3. Authenticated → access WG Portal      │ Admin disables user
+     ▼                                          ▼
+┌──────────────┐                         ┌──────────────────┐
+│  WireGuard   │  4. Download .conf      │   WG Access      │
+│   Portal     │◄────────────────────────│   Manager        │
+│ (port 8888)  │  6. Disable/enable peer │ (webhook receiver│
+└──────┬───────┘     via REST API        │  port 5000)      │
+       │                                 └──────────────────┘
+       │ manages                           5. Webhook fires:
+       ▼                                      "user disabled"
 ┌──────────────┐
-│  WireGuard   │  4. User downloads .conf file (keys + server IP)
-│   Portal     │
-│ (port 8888)  │
+│  wg0         │  The server interface. Has a list of allowed peers.
+│  (port 51820)│  When a peer is disabled, it's removed from this list.
 └──────────────┘
-
-      Then, separately:
-
-┌──────────┐                          ┌──────────────┐
-│   User   │ ═══ encrypted tunnel ═══ │  WireGuard   │
-│ (wg-quick│     using the .conf      │   server     │
-│  client) │     file from portal     │ (port 51820) │
-└──────────┘                          └──────────────┘
-                                             │
-                                       Internal network
-                                       (databases, servers, etc.)
+       ║
+       ║ encrypted tunnel (only works if peer is in wg0's list)
+       ║
+┌──────────────┐
+│  Client      │  Employee's machine. Runs wg-quick up test.conf
+│  (test iface)│  If peer removed from wg0 → tunnel dead, no access.
+└──────────────┘
 ```
 
-**Steps 1-4** happen in the browser. After that, the user connects with a standard
-WireGuard client using the downloaded config. WireGuard itself never talks to Keycloak.
+### Real-time revocation flow
+
+```
+Admin disables user in Keycloak UI
+  → keycloak-events extension fires webhook to wg-access-manager
+  → wg-access-manager verifies HMAC signature
+  → Sees enabled=false in the event
+  → Calls WG Portal API: disable all peers for this user
+  → WG Portal removes the peer from wg0
+  → Server stops accepting that client's traffic
+  → Existing .conf file becomes useless
+
+Admin re-enables user → reverse flow → peer added back to wg0 → tunnel works again
+```
+
+**How to verify it worked:**
+```bash
+# BEFORE disabling: peer is listed, has "latest handshake"
+sudo wg show wg0    # shows peer with allowed ips 10.10.0.3/32
+
+# AFTER disabling: peer is GONE
+sudo wg show wg0    # peer removed from list
+
+# Client side: no handshake = server is ignoring us
+sudo wg show test   # no "latest handshake" line = dead tunnel
+```
 
 ---
 
@@ -92,207 +123,137 @@ wg --version              # WireGuard tools (sudo apt install -y wireguard-tools
 
 ## Setup
 
-### 1. Create project structure
-
-```bash
-mkdir -p wireguard-poc/wg-portal-config wireguard-poc/wg-portal-data
-cd wireguard-poc
-```
-
-### 2. Create `docker-compose.yml`
-
-```yaml
-services:
-  postgres:
-    image: postgres:16
-    environment:
-      POSTGRES_DB: keycloak
-      POSTGRES_USER: keycloak
-      POSTGRES_PASSWORD: keycloak_db_pass
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U keycloak"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  keycloak:
-    image: quay.io/keycloak/keycloak:26.0
-    command: start-dev
-    environment:
-      KC_DB: postgres
-      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
-      KC_DB_USERNAME: keycloak
-      KC_DB_PASSWORD: keycloak_db_pass
-      KC_BOOTSTRAP_ADMIN_USERNAME: admin
-      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
-    ports:
-      - "8080:8080"
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-  wg-portal:
-    image: wgportal/wg-portal:v2
-    container_name: wg-portal
-    restart: unless-stopped
-    cap_add:
-      - NET_ADMIN
-    network_mode: "host"
-    volumes:
-      - /etc/wireguard:/etc/wireguard
-      - ./wg-portal-data:/app/data
-      - ./wg-portal-config:/app/config
-    depends_on:
-      - keycloak
-
-volumes:
-  postgres_data:
-```
-
-### 3. Create `wg-portal-config/config.yaml`
-
-```yaml
-core:
-  admin_user: admin@wgportal.local
-  admin_password: admin1234
-  create_default_peer: false
-  self_provisioning_allowed: true
-  import_existing: true
-  restore_state: true
-
-web:
-  listening_address: :8888
-  external_url: http://localhost:8888
-  site_title: WireGuard Portal Demo
-  session_secret: demo-session-secret-change-me
-  csrf_secret: demo-csrf-secret-change-me
-  request_logging: true
-
-auth:
-  min_password_length: 8
-  oidc:
-    - provider_name: keycloak
-      display_name: "Login with Keycloak"
-      base_url: "http://localhost:8080/realms/demo"
-      client_id: "wg-portal"
-      client_secret: "wg-portal-secret-123"
-      extra_scopes:
-        - profile
-        - email
-      registration_enabled: true
-      log_user_info: true
-
-advanced:
-  log_level: debug
-  log_pretty: true
-  start_listen_port: 51820
-  start_cidr_v4: 10.10.0.0/24
-  use_ip_v6: false
-  config_storage_path: /etc/wireguard
-```
-
-### 4. Start services
+### 1. Start services
 
 ```bash
 docker compose up -d
-# Wait ~20 seconds for Keycloak to initialize
+# Wait ~30 seconds for Keycloak to initialize
 ```
 
-### 5. Configure Keycloak
+This starts 4 containers:
+- **postgres** — database for Keycloak
+- **keycloak** — identity provider (custom build with webhook extension)
+- **wg-access-manager** — webhook receiver (FastAPI, auto-disables VPN peers)
+- **wg-portal** — WireGuard management UI + REST API
+
+### 2. Configure Keycloak
 
 ```bash
-# Get admin token
-ADMIN_TOKEN=$(curl -s -X POST \
-  "http://localhost:8080/realms/master/protocol/openid-connect/token" \
-  -d "client_id=admin-cli" \
-  -d "username=admin" \
-  -d "password=admin" \
-  -d "grant_type=password" \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
-
-# Create realm
-curl -s -X POST "http://localhost:8080/admin/realms" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"realm": "demo", "enabled": true}'
-
-# Create OIDC client for WireGuard Portal
-curl -s -X POST "http://localhost:8080/admin/realms/demo/clients" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "clientId": "wg-portal",
-    "enabled": true,
-    "protocol": "openid-connect",
-    "publicClient": false,
-    "secret": "wg-portal-secret-123",
-    "redirectUris": ["http://localhost:8888/*"],
-    "webOrigins": ["http://localhost:8888"],
-    "standardFlowEnabled": true
-  }'
-
-# Create test user
-curl -s -X POST "http://localhost:8080/admin/realms/demo/users" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "username": "testuser",
-    "email": "test@test.com",
-    "firstName": "Test",
-    "lastName": "User",
-    "enabled": true,
-    "emailVerified": true,
-    "credentials": [{"type": "password", "value": "testpass123", "temporary": false}]
-  }'
+./setup-keycloak.sh
 ```
 
-### 6. Restart WireGuard Portal and test
+This creates: realm `demo`, OIDC client `wg-portal`, test user `testuser`,
+and enables admin events with the webhook listener.
+
+### 3. Set WG Portal API token
+
+The API token only applies when the admin user is first created. If the admin already
+exists, set it manually (one-time):
 
 ```bash
+docker run --rm -v ./wg-portal-data:/data python:3.12-slim python3 -c "
+import sqlite3
+conn = sqlite3.connect('/data/sqlite.db')
+conn.execute(\"UPDATE users SET api_token='demo-api-token-change-me' WHERE identifier='admin@wgportal.local'\")
+conn.commit()
+print('API token set')
+"
 docker restart wg-portal
 ```
 
+### 4. First login and interface setup
+
 1. Open **http://localhost:8888** → click **"Login with Keycloak"** → `testuser` / `testpass123`
-2. Log in as admin (`admin@wgportal.local` / `admin1234`) and create a WireGuard interface (`wg0`, port `51820`, address `10.10.0.1/24`)
-3. Create a peer, set IP to `10.10.0.2/32`, download the `.conf` file
-4. Fix `AllowedIPs` in the `[Peer]` section of the downloaded config:
-   ```diff
-   - AllowedIPs = 10.10.0.2/32
-   + AllowedIPs = 10.10.0.0/24
-   ```
-5. Connect and test:
+   (this registers the test user in WG Portal)
+2. Log in as admin (`admin@wgportal.local` / `admin1234`)
+3. Create a WireGuard interface: name=`wg0`, port=`51820`, address=`10.10.0.1/24`
+
+### 5. Create a peer and test VPN
+
+1. As admin in WG Portal, create a peer:
+   - Assign to the test user
+   - IP Address: `10.10.0.3/32`
+   - Allowed IPs: `10.10.0.0/24` (this controls what traffic goes through the tunnel)
+2. Download the `.conf` file
+3. Connect:
    ```bash
-   sudo wg-quick up ./client.conf
-   ping 10.10.0.1                      # should get replies
-   sudo wg-quick down ./client.conf    # ALWAYS disconnect when done!
+   sudo wg-quick up ./test.conf
+   ping 10.10.0.1                    # should get replies
+   sudo wg show wg0                  # shows peer with "latest handshake"
    ```
+
+### 6. Test revocation
+
+1. Keep VPN connected
+2. Open Keycloak admin: http://localhost:8080 (`admin` / `admin`)
+3. Switch to **demo** realm (top-left dropdown)
+4. Go to **Users** → click **testuser** → toggle **Enabled** to **OFF** → **Save**
+5. Check what happened:
+   ```bash
+   # Webhook logs — should show "DISABLED" + "Disabled 1 peer(s)"
+   docker compose logs wg-access-manager --tail 10
+
+   # Server side — test peer should be GONE from the list
+   sudo wg show wg0
+
+   # Client side — no "latest handshake" = server is ignoring us
+   sudo wg show test
+   ```
+6. Re-enable user in Keycloak → peer comes back → tunnel works again
+
+### 7. Disconnect
+
+```bash
+sudo wg-quick down ./test.conf
+```
+
+If internet breaks: `sudo ip link delete test && sudo resolvconf -d test`
 
 ---
 
-## Test results (2026-02-09)
+## Test results (2026-02-10)
 
+### VPN connection
 ```
-$ sudo wg show
+$ sudo wg show wg0
 interface: wg0
   public key: RLcRD02/30X1tl5XcrPIEvxgzRH+kakks2Yn6tHZyAY=
   listening port: 51820
 
-peer: s2Vxmo+aOUv/g3ZGX0zX6HiSJFrUwyQH9igcHHGhtD4=
-  endpoint: 127.0.0.1:41510
-  latest handshake: 6 seconds ago
-  transfer: 180 B received, 92 B sent
+peer: bRaRrpXcA45ik6/MhpDXgn0tiDE/6wvBUplnRJRN/ko=    ← test user
+  preshared key: (hidden)
+  allowed ips: 10.10.0.3/32
 
 $ ping 10.10.0.1
-64 bytes from 10.10.0.1: icmp_seq=1 ttl=64 time=0.044 ms
---- 5 packets transmitted, 5 received, 0% packet loss ---
+64 bytes from 10.10.0.1: icmp_seq=1 ttl=64 time=0.029 ms
 ```
 
-**Full flow verified:**
-- Keycloak login (OIDC) → WireGuard Portal access
-- Download .conf from portal → connect with WireGuard client
-- Encrypted VPN tunnel works, 0% packet loss
+### After disabling user in Keycloak
+```
+$ docker compose logs wg-access-manager --tail 5
+wg-access-manager  | Received event: type=admin.USER-UPDATE
+wg-access-manager  | User f2404ed1-... DISABLED in Keycloak — disabling VPN peers
+wg-access-manager  | Disabled 1 peer(s) for user f2404ed1-...
+
+$ sudo wg show wg0
+interface: wg0
+  public key: RLcRD02/30X1tl5XcrPIEvxgzRH+kakks2Yn6tHZyAY=
+  listening port: 51820
+
+peer: s2Vxmo+aOUv/g3ZGX0zX6HiSJFrUwyQH9igcHHGhtD4=    ← only admin peer remains
+  preshared key: (hidden)
+  allowed ips: 10.10.0.2/32
+
+# test user's peer is GONE — server removed it
+```
+
+### WG Portal UI confirmation
+Peer shows: "Peer is disabled, reason: User disabled in Keycloak"
+
+**Full revocation flow verified:**
+- Disable user in Keycloak → webhook fires → peer removed from wg0 automatically
+- Re-enable user in Keycloak → webhook fires → peer added back to wg0
+- Round-trip time: ~2 seconds
 
 ---
 
@@ -303,7 +264,11 @@ $ ping 10.10.0.1
 | `invalid parameter: redirect_uri` | Set redirect URIs to `http://localhost:8888/*` in Keycloak client settings |
 | `lookup keycloak: server misbehaving` | Use `localhost:8080` not `keycloak:8080` in wg-portal config |
 | `password too weak` panic | Set admin password to at least 8 characters |
-| **Internet stops working** | `sudo wg-quick down ./client.conf` or `sudo ip link delete client && sudo resolvconf -d client` |
+| **Internet stops working** | `sudo wg-quick down ./test.conf` or `sudo ip link delete test && sudo resolvconf -d test` |
+| Webhook not firing | Verify `ext-event-webhook` is in realm Event Listeners (setup-keycloak.sh does this) |
+| wg-access-manager can't reach WG Portal | Check `extra_hosts` in docker-compose and that WG Portal is running on host |
+| API returns 401 | Set API token in SQLite DB (see Setup step 3) |
+| keycloak-events NoSuchMethodError | Use v0.35 for Keycloak 26.0 (v0.51 needs KC 26.5+) |
 
 ---
 
@@ -319,6 +284,7 @@ Users will be prompted to set up a TOTP app (Google Authenticator, etc.) on next
 
 - Enable **HTTPS/TLS** on Keycloak and WireGuard Portal
 - Change all **passwords and secrets** to strong random values
+- Change `WEBHOOK_SECRET` and `WG_PORTAL_API_TOKEN` to long random strings
 - To use an **existing Keycloak**: remove postgres + keycloak from docker-compose, update `base_url`
 
 ## Credentials (demo only)
@@ -326,5 +292,5 @@ Users will be prompted to set up a TOTP app (Google Authenticator, etc.) on next
 | Service | Username | Password | URL |
 |---|---|---|---|
 | Keycloak admin | `admin` | `admin` | http://localhost:8080 |
-| WireGuard Portal | `admin@wgportal.local` | `admin1234` | http://localhost:8888 |
-| Test user | `testuser` | `testpass123` | via WG Portal |
+| WireGuard Portal admin | `admin@wgportal.local` | `admin1234` | http://localhost:8888 |
+| Test user | `testuser` | `testpass123` | via WG Portal (Keycloak login) |

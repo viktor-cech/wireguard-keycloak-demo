@@ -14,9 +14,9 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── Keycloak (Identity Provider) ──
+  # ── Keycloak (Identity Provider) with webhook extension ──
   keycloak:
-    image: quay.io/keycloak/keycloak:26.0
+    build: ./keycloak
     command: start-dev
     environment:
       KC_DB: postgres
@@ -25,11 +25,27 @@ services:
       KC_DB_PASSWORD: keycloak_db_pass
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # p2-inc/keycloak-events: system-level catch-all webhook
+      WEBHOOK_URI: http://wg-access-manager:5000/webhook/keycloak
+      WEBHOOK_SECRET: changeme-webhook-secret
     ports:
       - "8080:8080"
     depends_on:
       postgres:
         condition: service_healthy
+
+  # ── WG Access Manager (webhook receiver → VPN revocation) ──
+  wg-access-manager:
+    build: ./wg-access-manager
+    environment:
+      WG_PORTAL_URL: http://host.docker.internal:8888
+      WG_PORTAL_ADMIN_USER: admin@wgportal.local
+      WG_PORTAL_API_TOKEN: demo-api-token-change-me
+      WEBHOOK_SECRET: changeme-webhook-secret
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - keycloak
 
   # ── WireGuard Portal (the middleman) ──
   wg-portal:
